@@ -902,7 +902,7 @@ body{background:linear-gradient(-45deg,#020617,#0f172a,#020617,#1e1b4b);backgrou
 <input type="password" name="p" required class="input-glow w-full px-5 py-3.5 bg-slate-900/60 border border-slate-700/40 rounded-xl text-white placeholder-slate-600 focus:border-amber-500/40 focus:outline-none transition-all" placeholder="รหัสผ่าน"></div>
 <div class="gb"><span class="text-center text-white cursor-pointer"><button type="submit" class="w-full text-base">🔓 เข้าสู่ระบบ</button></span></div>
 </form>
-<p class="mt-8 text-center text-slate-600 text-xs">Default: admin / admin123</p>
+<p class="mt-8 text-center text-slate-600 text-xs">Developed by Weerapong Saengloothong (Wee)</p>
 </div></body></html>'''
 
 
@@ -1308,3 +1308,4 @@ if __name__ == '__main__':
     print(f"  🌐 Port: {port} | Login: admin / admin123")
     print("=" * 65)
     socketio.run(app, host='0.0.0.0', port=port, debug=False, use_reloader=False)
+
