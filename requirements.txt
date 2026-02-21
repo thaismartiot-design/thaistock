@@ -1,9 +1,9 @@
 flask==3.1.0
 flask-socketio==5.4.1
-eventlet==0.37.0
-yfinance==0.2.61
-curl_cffi>=0.5.10
-pandas==2.2.3
-numpy==2.2.1
-requests==2.32.3
 gunicorn==23.0.0
+gevent==24.11.1
+gevent-websocket==0.10.1
+pandas==2.2.3
+numpy==1.26.4
+yfinance==0.2.51
+requests==2.32.3
