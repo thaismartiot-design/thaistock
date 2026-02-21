@@ -1,26 +1,37 @@
 """
-TCSM THAI STOCK PRO v4.0 — SET STOCK SCANNER (PRODUCTION GRADE)
+TCSM THAI STOCK PRO v4.1 — SET STOCK SCANNER (PRODUCTION GRADE)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-FIXES from v3.2:
-  ✅ eventlet.monkey_patch() FIRST before ALL imports
-  ✅ Removed delisted tickers: BTSG, MAKRO, INTUCH (merged/delisted)
-  ✅ Fixed Flask application context in background scanner thread
-  ✅ Fixed socket shutdown / Bad file descriptor errors
-  ✅ Proper error boundaries for all emit calls
-  ✅ Graceful handling of Yahoo 401/404 per-ticker
-  ✅ Ultimate professional UI with dark glassmorphism
-  ✅ Enhanced real-time WebSocket with auto-recovery
-  ✅ Mobile-responsive design
+KEY CHANGE: Switched from eventlet → gevent
+  ✅ gevent monkey.patch_all() works correctly with gunicorn
+  ✅ No more "RLock(s) were not greened" errors
+  ✅ No more "Working outside of application/request context"
+  ✅ No more monkey_patch ordering issues
+  ✅ Removed all delisted tickers (BTSG, MAKRO, INTUCH)
+  ✅ Auto-delist detection for future ticker changes
+  ✅ Professional glassmorphism UI with real-time WebSocket
 
-Deploy: gunicorn --worker-class eventlet -w 1 -b 0.0.0.0:$PORT app:app
+DEPLOY on Render:
+  Build Command:  pip install -r requirements.txt
+  Start Command:  gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker -w 1 -b 0.0.0.0:$PORT app:app
+
+requirements.txt:
+  flask
+  flask-socketio
+  gunicorn
+  gevent
+  gevent-websocket
+  pandas
+  numpy
+  yfinance
+  requests
 """
 # ═══════════════════════════════════════════════════════════════════════════════
-#  CRITICAL: eventlet monkey_patch MUST be the VERY FIRST thing
+#  CRITICAL: gevent monkey patch MUST be the VERY FIRST thing
 # ═══════════════════════════════════════════════════════════════════════════════
-import eventlet
-eventlet.monkey_patch(all=True)
+from gevent import monkey
+monkey.patch_all()
 
-# NOW import everything else
+import gevent
 from flask import Flask, render_template_string, request, redirect, url_for, session, flash, jsonify
 from flask_socketio import SocketIO, emit
 from datetime import datetime, timezone, timedelta
@@ -38,10 +49,14 @@ app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', secrets.token_hex(32))
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=7)
 
 socketio = SocketIO(
-    app, cors_allowed_origins="*", async_mode='eventlet',
-    ping_timeout=120, ping_interval=25,
-    logger=False, engineio_logger=False, always_connect=True,
-    manage_session=False
+    app,
+    cors_allowed_origins="*",
+    async_mode='gevent',
+    ping_timeout=120,
+    ping_interval=25,
+    logger=False,
+    engineio_logger=False,
+    always_connect=True,
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -68,11 +83,11 @@ def sanitize(obj):
     return obj
 
 def safe_emit(event, data, **kwargs):
-    """Emit with full error protection — no crashes on bad fd or context"""
+    """Emit with full error protection"""
     try:
         socketio.emit(event, sanitize(data), **kwargs)
     except (BrokenPipeError, OSError, IOError):
-        pass  # Client disconnected — safe to ignore
+        pass
     except RuntimeError as e:
         if 'Working outside' not in str(e):
             logger.error(f"Emit '{event}' RuntimeError: {e}")
@@ -81,11 +96,12 @@ def safe_emit(event, data, **kwargs):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  CONFIG — Removed delisted: BTSG, MAKRO, INTUCH (all confirmed delisted/merged)
+#  CONFIG — Removed delisted: BTSG, MAKRO, INTUCH
 # ═══════════════════════════════════════════════════════════════════════════════
 class C:
     SCAN_INTERVAL = 90
     BATCH_SIZE = 5
+    DELIST_THRESHOLD = 3
 
     STOCH_RSI_K=3; STOCH_RSI_D=3; RSI_PD=14; STOCH_PD=14
     ENH_K=21; ENH_D=3; ENH_SLOW=5
@@ -98,8 +114,8 @@ class C:
     ATR_PD=14; ATR_SL=1.5; RR=2.0
     DIV_BARS=20; VOL_PD=20
 
-    # Thai stocks — VERIFIED active tickers on SET (Feb 2026)
-    # Removed: BTSG (merged→BTS), MAKRO (merged→CPALL/Lotus's), INTUCH (merged→ADVANC)
+    # VERIFIED active SET tickers (Feb 2026)
+    # Removed: BTSG (merged→BTS), MAKRO (merged→CPALL), INTUCH (merged→ADVANC)
     STOCKS = [
         "PTT","PTTEP","PTTGC","TOP","IRPC","BANPU","OR",
         "KBANK","BBL","SCB","KTB","TTB","TISCO","KKP",
@@ -121,9 +137,6 @@ class C:
         "MEGA","CHG",
     ]
     STOCKS = list(dict.fromkeys(STOCKS))
-
-    # Tickers that have failed — skip them automatically after N failures
-    DELIST_THRESHOLD = 3
 
     SECTOR_MAP = {}
     _e = {"PTT","PTTEP","PTTGC","TOP","IRPC","BANPU","OR","GULF","EGCO","GPSC","RATCH","EA","BGRIM","GGC","BAFS","BCP"}
@@ -161,9 +174,6 @@ class YFClient:
         'Accept-Language': 'en-US,en;q=0.9',
         'Accept-Encoding': 'gzip, deflate, br',
         'Connection': 'keep-alive',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none',
     }
 
     def __init__(self):
@@ -175,7 +185,7 @@ class YFClient:
         self._crumb_time = 0
         self._session = None
         self._fail_count = {}
-        self._dead_tickers = set()  # Auto-detected delisted tickers
+        self._dead_tickers = set()
 
     def _get_session(self):
         if self._session is None:
@@ -208,7 +218,7 @@ class YFClient:
         self._fail_count[symbol] = fc
         if fc >= C.DELIST_THRESHOLD:
             self._dead_tickers.add(symbol)
-            logger.warning(f"☠ {symbol}.BK marked as dead/delisted after {fc} failures ({reason})")
+            logger.warning(f"☠ {symbol}.BK marked dead after {fc} failures ({reason})")
             return True
         return False
 
@@ -222,17 +232,15 @@ class YFClient:
                       'includePrePost': 'false', 'events': 'div,splits'}
             if crumb:
                 params['crumb'] = crumb
-
             r = s.get(url, params=params, timeout=15,
                       cookies=cookie if cookie else None)
-
             if r.status_code == 200:
                 data = r.json()
                 chart = data.get('chart', {}).get('result', [])
                 if not chart:
                     err = data.get('chart', {}).get('error', {})
                     if err and 'No data found' in str(err.get('description', '')):
-                        self._mark_dead(symbol, "No data found from API")
+                        self._mark_dead(symbol, "No data found")
                     return None
                 result = chart[0]
                 timestamps = result.get('timestamp', [])
@@ -250,12 +258,12 @@ class YFClient:
                     if len(df) >= 20:
                         return df
             elif r.status_code == 404:
-                self._mark_dead(symbol, "404 Not Found")
+                self._mark_dead(symbol, "404")
             elif r.status_code == 429:
-                logger.warning(f"Direct API 429 for {yf_sym}, backing off")
-                eventlet.sleep(8)
+                logger.warning(f"Yahoo 429 for {yf_sym}, backing off")
+                gevent.sleep(8)
             elif r.status_code in (401, 403):
-                logger.warning(f"Direct API {r.status_code} for {yf_sym}")
+                logger.warning(f"Yahoo {r.status_code} for {yf_sym}")
         except Exception as e:
             logger.warning(f"Direct API {yf_sym}: {e}")
         return None
@@ -315,19 +323,16 @@ class YFClient:
     def get_history(self, symbol, period="3mo", interval="1h"):
         if symbol in self._dead_tickers:
             return None
-
         cache_key = f"{symbol}_{period}_{interval}"
         with self._lock:
             if cache_key in self._cache and time.time() - self._cache_time.get(cache_key, 0) < 55:
                 return self._cache[cache_key]
-
         df = None
         methods = [
             ("direct", self._fetch_direct),
             ("yfinance", self._fetch_yfinance),
             ("yf_download", self._fetch_yf_download),
         ]
-
         for name, method in methods:
             if symbol in self._dead_tickers:
                 return None
@@ -342,8 +347,7 @@ class YFClient:
                     return df
             except Exception as e:
                 logger.warning(f"{name} failed for {symbol}: {e}")
-            eventlet.sleep(0.5)
-
+            gevent.sleep(0.5)
         if symbol not in self._dead_tickers:
             self._mark_dead(symbol, "all methods failed")
         return None
@@ -424,7 +428,7 @@ def get_market_session():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  TCSM ENGINE
+#  TCSM ANALYSIS ENGINE
 # ═══════════════════════════════════════════════════════════════════════════════
 def analyze_stock(symbol):
     try:
@@ -499,7 +503,7 @@ def analyze_stock(symbol):
             conf_sell = True; sx = max(sx, rsx)
         bx = int(bx); sx = int(sx); bull_zn = int(bull_zn); bear_zn = int(bear_zn)
 
-        # ENGINE B: SMARTMOMENTUM
+        # ENGINE B: SMARTMOMENTUM (7-Indicator Weighted)
         rsi_v = float(calc_rsi(close, C.RSI_PD).iloc[-1])
         rsi_sc = float((rsi_v - 50) * 2.0)
         atr_v = float(calc_atr(high, low, close, C.ATR_PD).iloc[-1])
@@ -542,7 +546,7 @@ def analyze_stock(symbol):
         obv = calc_obv(close, volume); obv_sma = sma(obv, 20)
         obv_bullish = bool(obv.iloc[-1] > obv_sma.iloc[-1])
 
-        # MTF
+        # MTF Analysis
         mtf = {}
         h_score = 50 + (rsi_v - 50) * 0.8
         mtf['1h'] = {'score': round(h_score, 1), 'summary': 'Buy' if h_score > 55 else ('Sell' if h_score < 45 else 'Neutral')}
@@ -578,7 +582,7 @@ def analyze_stock(symbol):
         ema_golden = bool(ema20 > ema50)
         trend_label = "UPTREND" if ema_golden and price > ema20 else ("DOWNTREND" if not ema_golden and price < ema20 else "SIDEWAYS")
 
-        # Signal Strength
+        # Signal Strength Scoring
         am = abs(momentum); sig_str = 0.0
         sig_str += 20 if am >= C.SIG_TH else (12 if am >= C.CHG_TH else 5)
         sig_str += min(am * 0.35, 15)
@@ -711,8 +715,7 @@ class Store:
         self.last_scan = "Never"; self.scan_count = 0; self.connected = 0
         self.status = "STARTING"; self.errors = []; self.first_scan_done = False
         self.stats = {'buy': 0, 'sell': 0, 'strong': 0, 'conf': 0, 'weak': 0}
-        self.dead_tickers = []
-        self.ok_count = 0; self.fail_count = 0
+        self.dead_tickers = []; self.ok_count = 0; self.fail_count = 0
 
     def err(self, m):
         self.errors.insert(0, f"[{ts()}] {m}")
@@ -768,12 +771,12 @@ def login_req(f):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  SCANNER — Runs inside Flask app context to prevent RuntimeError
+#  SCANNER — Uses gevent.sleep() and runs inside app context
 # ═══════════════════════════════════════════════════════════════════════════════
 def scanner():
-    """Background scanner — wrapped in app.app_context() to fix context errors"""
-    eventlet.sleep(8)
-    logger.info("🚀 TCSM Thai Stock Pro v4.0 Scanner started (production-grade)")
+    """Background scanner with gevent — no monkey_patch conflicts"""
+    gevent.sleep(8)
+    logger.info("🚀 TCSM Thai Stock Pro v4.1 Scanner started (gevent production)")
     store.status = "RUNNING"
 
     with app.app_context():
@@ -828,8 +831,8 @@ def scanner():
                                 fail += 1
                         except Exception as e:
                             fail += 1; store.err(f"{symbol}: {e}")
-                        eventlet.sleep(0.8)
-                    eventlet.sleep(2)
+                        gevent.sleep(0.8)
+                    gevent.sleep(2)
 
                 dur = time.time() - t0
                 store.first_scan_done = True
@@ -849,44 +852,32 @@ def scanner():
                             f"Clients: {store.connected}")
             except Exception as e:
                 logger.error(f"Scanner: {e}\n{traceback.format_exc()}")
-            eventlet.sleep(C.SCAN_INTERVAL)
+            gevent.sleep(C.SCAN_INTERVAL)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  HTML TEMPLATES
 # ═══════════════════════════════════════════════════════════════════════════════
 LOGIN_HTML = '''<!DOCTYPE html><html lang="th"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>TCSM Thai Stock Pro v4.0</title>
+<title>TCSM Thai Stock Pro v4.1</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <style>
 @keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-10px)}}
 @keyframes gradient{0%{background-position:0% 50%}50%{background-position:100% 50%}100%{background-position:0% 50%}}
-@keyframes shimmer{0%{background-position:-200% 0}100%{background-position:200% 0}}
-body{background:linear-gradient(-45deg,#020617,#0f172a,#020617,#1e1b4b);background-size:400% 400%;animation:gradient 20s ease infinite;overflow:hidden}
+body{background:linear-gradient(-45deg,#020617,#0f172a,#020617,#1e1b4b);background-size:400% 400%;animation:gradient 20s ease infinite}
 .card{background:rgba(15,23,42,.7);backdrop-filter:blur(24px);border:1px solid rgba(255,255,255,.06);box-shadow:0 25px 50px -12px rgba(0,0,0,.5)}
 .gb{position:relative;overflow:hidden;border-radius:12px;transition:all .3s}.gb:hover{transform:translateY(-1px);box-shadow:0 8px 30px rgba(234,179,8,.25)}
 .gb::before{content:'';position:absolute;top:-50%;left:-50%;width:200%;height:200%;background:conic-gradient(from 0deg,transparent,rgba(234,179,8,.4),transparent 30%);animation:spin 3s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
 .gb>span{position:relative;z-index:1;display:block;padding:14px;background:linear-gradient(135deg,#92400e,#d97706);border-radius:11px;font-weight:700;letter-spacing:.5px}
 .input-glow:focus{box-shadow:0 0 0 3px rgba(234,179,8,.15),0 0 20px rgba(234,179,8,.08)}
-.particles{position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;overflow:hidden}
-.particle{position:absolute;width:2px;height:2px;background:rgba(234,179,8,.3);border-radius:50%;animation:drift 8s infinite}
-@keyframes drift{0%{transform:translateY(100vh) scale(0);opacity:0}50%{opacity:1}100%{transform:translateY(-10vh) scale(1);opacity:0}}
 </style></head>
 <body class="min-h-screen flex items-center justify-center p-4">
-<div class="particles">
-<div class="particle" style="left:10%;animation-delay:0s;animation-duration:6s"></div>
-<div class="particle" style="left:20%;animation-delay:1s;animation-duration:8s"></div>
-<div class="particle" style="left:40%;animation-delay:2s;animation-duration:7s"></div>
-<div class="particle" style="left:60%;animation-delay:0.5s;animation-duration:9s"></div>
-<div class="particle" style="left:75%;animation-delay:3s;animation-duration:6.5s"></div>
-<div class="particle" style="left:90%;animation-delay:1.5s;animation-duration:8.5s"></div>
-</div>
 <div class="card rounded-3xl w-full max-w-md p-10 relative z-10">
 <div class="text-center mb-10">
 <div class="text-7xl mb-5" style="animation:float 3s ease-in-out infinite">🇹🇭</div>
 <h1 class="text-4xl font-black bg-clip-text text-transparent bg-gradient-to-r from-yellow-300 via-amber-400 to-orange-400 tracking-tight">TCSM Pro</h1>
-<p class="text-gray-500 text-sm mt-2 font-medium tracking-wide">Thai Stock Scanner v4.0</p>
+<p class="text-gray-500 text-sm mt-2 font-medium tracking-wide">Thai Stock Scanner v4.1</p>
 <div class="flex justify-center gap-2 mt-4">
 <span class="text-[10px] bg-green-500/10 text-green-400 px-3 py-1 rounded-full border border-green-500/20 font-semibold">SET 70+</span>
 <span class="text-[10px] bg-cyan-500/10 text-cyan-400 px-3 py-1 rounded-full border border-cyan-500/20 font-semibold">Dual Engine</span>
@@ -902,12 +893,12 @@ body{background:linear-gradient(-45deg,#020617,#0f172a,#020617,#1e1b4b);backgrou
 <input type="password" name="p" required class="input-glow w-full px-5 py-3.5 bg-slate-900/60 border border-slate-700/40 rounded-xl text-white placeholder-slate-600 focus:border-amber-500/40 focus:outline-none transition-all" placeholder="รหัสผ่าน"></div>
 <div class="gb"><span class="text-center text-white cursor-pointer"><button type="submit" class="w-full text-base">🔓 เข้าสู่ระบบ</button></span></div>
 </form>
-<p class="mt-8 text-center text-slate-600 text-xs">Developed by Weerapong Saengloothong (Wee)</p>
+<p class="mt-8 text-center text-slate-700 text-[10px]">TCSM Thai Stock Pro © 2026</p>
 </div></body></html>'''
 
 
 DASH_HTML = '''<!DOCTYPE html><html lang="th"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>🇹🇭 TCSM Thai Stock Pro v4.0</title>
+<title>🇹🇭 TCSM Thai Stock Pro v4.1</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
 <style>
@@ -917,7 +908,6 @@ DASH_HTML = '''<!DOCTYPE html><html lang="th"><head><meta charset="UTF-8"><meta 
 @keyframes glow{0%,100%{box-shadow:0 0 12px rgba(234,179,8,.15)}50%{box-shadow:0 0 30px rgba(234,179,8,.35)}}.glow{animation:glow 2.5s infinite}
 @keyframes slideUp{from{transform:translateY(12px);opacity:0}to{transform:translateY(0);opacity:1}}.slideUp{animation:slideUp .3s ease-out}
 @keyframes loading{0%{transform:translateX(-100%)}50%{transform:translateX(0%)}100%{transform:translateX(100%)}}
-@keyframes fadeIn{from{opacity:0}to{opacity:1}}.fadeIn{animation:fadeIn .4s}
 .glass{background:rgba(15,23,42,.65);backdrop-filter:blur(16px);border:1px solid rgba(51,65,85,.3)}
 .gc{background:rgba(15,23,42,.5);backdrop-filter:blur(8px);border:1px solid rgba(51,65,85,.25);transition:all .2s}
 .gc:hover{border-color:rgba(234,179,8,.15);background:rgba(15,23,42,.7)}
@@ -926,7 +916,6 @@ DASH_HTML = '''<!DOCTYPE html><html lang="th"><head><meta charset="UTF-8"><meta 
 .ss{border-left:3px solid #ef4444;background:linear-gradient(135deg,rgba(127,29,29,.06),transparent)}
 .tag{display:inline-flex;align-items:center;padding:2px 8px;border-radius:6px;font-size:9px;font-weight:600;letter-spacing:.3px}
 body{background:#020617;color:#e2e8f0}
-.stat-card{position:relative;overflow:hidden}.stat-card::after{content:'';position:absolute;top:0;right:0;width:40px;height:40px;border-radius:0 0 0 40px;opacity:.05}
 .strength-ring{width:48px;height:48px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:12px}
 </style></head>
 <body class="min-h-screen text-[13px]">
@@ -937,10 +926,10 @@ body{background:#020617;color:#e2e8f0}
 <div>
 <div class="flex items-center gap-3">
 <h1 class="text-lg md:text-xl font-black bg-clip-text text-transparent bg-gradient-to-r from-yellow-300 via-amber-400 to-orange-400">🇹🇭 TCSM Thai Stock Pro</h1>
-<span class="tag bg-amber-500/10 text-amber-400 border border-amber-500/20">v4.0</span>
+<span class="tag bg-amber-500/10 text-amber-400 border border-amber-500/20">v4.1</span>
 <span class="tag bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">PRODUCTION</span>
 </div>
-<p class="text-slate-600 text-[10px] mt-0.5 font-medium">Dual Engine • 7-Indicator SmartMomentum • MTF Analysis • Volume/OBV/Divergence</p>
+<p class="text-slate-600 text-[10px] mt-0.5 font-medium">Dual Engine • 7-Indicator SmartMomentum • MTF • Divergence • OBV • Volume</p>
 </div>
 <div class="flex items-center gap-3">
 <div id="clk" class="glass px-4 py-2 rounded-xl font-mono text-sm font-bold text-amber-400 tracking-wider">--:--:--</div>
@@ -949,19 +938,19 @@ body{background:#020617;color:#e2e8f0}
 <a href="/logout" class="px-4 py-2 bg-red-600/40 hover:bg-red-500/60 rounded-xl text-xs transition font-semibold border border-red-500/20">ออก</a>
 </div></div>
 
-<!-- STATS ROW -->
+<!-- STATS -->
 <div class="grid grid-cols-4 md:grid-cols-8 gap-2 mb-3">
-<div class="sc stat-card rounded-xl p-3 text-center"><div class="text-slate-500 text-[10px] uppercase font-semibold tracking-wider">รอบสแกน</div><div id="scc" class="font-black text-xl mt-1">0</div></div>
-<div class="sc stat-card rounded-xl p-3 text-center"><div class="text-slate-500 text-[10px] uppercase font-semibold tracking-wider">สัญญาณ</div><div id="si" class="font-black text-xl text-amber-400 mt-1">0</div></div>
-<div class="sc stat-card rounded-xl p-3 text-center"><div class="text-slate-500 text-[10px] uppercase font-semibold tracking-wider">Strong</div><div id="st2" class="font-black text-xl text-amber-300 mt-1">0</div></div>
-<div class="sc stat-card rounded-xl p-3 text-center"><div class="text-slate-500 text-[10px] uppercase font-semibold tracking-wider">ซื้อ</div><div id="bu" class="font-black text-xl text-emerald-400 mt-1">0</div></div>
-<div class="sc stat-card rounded-xl p-3 text-center"><div class="text-slate-500 text-[10px] uppercase font-semibold tracking-wider">ขาย</div><div id="se" class="font-black text-xl text-red-400 mt-1">0</div></div>
-<div class="sc stat-card rounded-xl p-3 text-center"><div class="text-slate-500 text-[10px] uppercase font-semibold tracking-wider">ช่วงเวลา</div><div id="ses" class="text-amber-400 font-bold text-[11px] mt-1.5">—</div></div>
-<div class="sc stat-card rounded-xl p-3 text-center"><div class="text-slate-500 text-[10px] uppercase font-semibold tracking-wider">สแกนล่าสุด</div><div id="ls" class="font-mono text-xs mt-1.5">--:--</div></div>
-<div class="sc stat-card rounded-xl p-3 text-center"><div class="text-slate-500 text-[10px] uppercase font-semibold tracking-wider">สถานะ</div><div id="ss2" class="text-cyan-400 font-bold text-xs mt-1.5">INIT</div></div>
+<div class="sc rounded-xl p-3 text-center"><div class="text-slate-500 text-[10px] uppercase font-semibold tracking-wider">รอบสแกน</div><div id="scc" class="font-black text-xl mt-1">0</div></div>
+<div class="sc rounded-xl p-3 text-center"><div class="text-slate-500 text-[10px] uppercase font-semibold tracking-wider">สัญญาณ</div><div id="si" class="font-black text-xl text-amber-400 mt-1">0</div></div>
+<div class="sc rounded-xl p-3 text-center"><div class="text-slate-500 text-[10px] uppercase font-semibold tracking-wider">Strong</div><div id="st2" class="font-black text-xl text-amber-300 mt-1">0</div></div>
+<div class="sc rounded-xl p-3 text-center"><div class="text-slate-500 text-[10px] uppercase font-semibold tracking-wider">ซื้อ</div><div id="bu" class="font-black text-xl text-emerald-400 mt-1">0</div></div>
+<div class="sc rounded-xl p-3 text-center"><div class="text-slate-500 text-[10px] uppercase font-semibold tracking-wider">ขาย</div><div id="se" class="font-black text-xl text-red-400 mt-1">0</div></div>
+<div class="sc rounded-xl p-3 text-center"><div class="text-slate-500 text-[10px] uppercase font-semibold tracking-wider">ช่วงเวลา</div><div id="ses" class="text-amber-400 font-bold text-[11px] mt-1.5">—</div></div>
+<div class="sc rounded-xl p-3 text-center"><div class="text-slate-500 text-[10px] uppercase font-semibold tracking-wider">สแกนล่าสุด</div><div id="ls" class="font-mono text-xs mt-1.5">--:--</div></div>
+<div class="sc rounded-xl p-3 text-center"><div class="text-slate-500 text-[10px] uppercase font-semibold tracking-wider">สถานะ</div><div id="ss2" class="text-cyan-400 font-bold text-xs mt-1.5">INIT</div></div>
 </div>
 
-<!-- ALERT BANNER -->
+<!-- ALERT -->
 <div id="al" class="hidden mb-3"><div class="bg-gradient-to-r from-amber-950/50 to-orange-950/30 border border-amber-600/40 rounded-2xl p-5 glow">
 <div class="flex items-center gap-4"><span class="text-4xl" id="ai">🎯</span>
 <div class="flex-1"><div id="at" class="font-bold text-amber-200 text-base"></div><div id="ax" class="text-amber-300/60 text-sm mt-1"></div></div>
@@ -970,11 +959,11 @@ body{background:#020617;color:#e2e8f0}
 <!-- MAIN GRID -->
 <div class="grid grid-cols-1 xl:grid-cols-12 gap-3">
 
-<!-- LEFT: STOCK LIST -->
+<!-- LEFT: STOCKS -->
 <div class="xl:col-span-3 space-y-3"><div class="glass rounded-2xl p-3">
 <div class="flex justify-between items-center mb-3">
 <h2 class="font-bold text-sm flex items-center gap-2">💹 หุ้นไทย <span id="ps" class="text-[9px] text-slate-600 font-normal">กำลังโหลด</span></h2>
-<input id="search" type="text" placeholder="ค้นหาหุ้น..." class="bg-slate-900/50 border border-slate-700/30 rounded-xl px-3 py-1.5 text-xs w-28 focus:outline-none focus:border-amber-500/40 transition-all" oninput="rP()">
+<input id="search" type="text" placeholder="ค้นหา..." class="bg-slate-900/50 border border-slate-700/30 rounded-xl px-3 py-1.5 text-xs w-28 focus:outline-none focus:border-amber-500/40 transition-all" oninput="rP()">
 </div>
 <div class="flex flex-wrap gap-1 mb-3 text-[10px]">
 <button onclick="fP('all')" class="px-2.5 py-1 rounded-lg pf bg-amber-600/80 transition font-semibold" data-c="all">ทั้งหมด</button>
@@ -1000,8 +989,7 @@ body{background:#020617;color:#e2e8f0}
 <button onclick="fS('BUY')" class="px-2.5 py-1 rounded-lg sf bg-slate-700/60 transition font-semibold" data-c="BUY">🟢 ซื้อ</button>
 <button onclick="fS('SELL')" class="px-2.5 py-1 rounded-lg sf bg-slate-700/60 transition font-semibold" data-c="SELL">🔴 ขาย</button>
 </div></div>
-<div id="sg" class="space-y-2.5">
-<div class="glass rounded-2xl p-10 text-center text-slate-500">
+<div id="sg" class="space-y-2.5"><div class="glass rounded-2xl p-10 text-center text-slate-500">
 <div class="text-5xl mb-4">📡</div>
 <div class="text-base font-semibold">กำลังสแกนหุ้นไทย SET...</div>
 <div class="text-xs mt-2 text-slate-600">Dual Engine • MTF • Volume • OBV • Divergence</div>
@@ -1010,11 +998,11 @@ body{background:#020617;color:#e2e8f0}
 
 <!-- RIGHT: PANELS -->
 <div class="xl:col-span-3 space-y-3">
-<div class="glass rounded-2xl p-3"><h3 class="font-bold text-[11px] text-amber-400 mb-2.5 flex items-center gap-1.5">📊 Top Momentum</h3>
+<div class="glass rounded-2xl p-3"><h3 class="font-bold text-[11px] text-amber-400 mb-2.5">📊 Top Momentum</h3>
 <div id="tm" class="space-y-1 max-h-[200px] overflow-y-auto"></div></div>
-<div class="glass rounded-2xl p-3"><h3 class="font-bold text-[11px] text-emerald-400 mb-2.5 flex items-center gap-1.5">📈 กลุ่มอุตสาหกรรม</h3>
+<div class="glass rounded-2xl p-3"><h3 class="font-bold text-[11px] text-emerald-400 mb-2.5">📈 กลุ่มอุตสาหกรรม</h3>
 <div id="hm" class="grid grid-cols-2 gap-1.5 text-[10px]"></div></div>
-<div class="glass rounded-2xl p-3"><h3 class="font-bold text-[11px] text-violet-400 mb-2.5 flex items-center gap-1.5">📡 Live Log</h3>
+<div class="glass rounded-2xl p-3"><h3 class="font-bold text-[11px] text-violet-400 mb-2.5">📡 Live Log</h3>
 <div id="lg" class="h-36 overflow-y-auto font-mono text-[9px] space-y-0.5 leading-relaxed"></div></div>
 </div></div>
 
@@ -1023,8 +1011,7 @@ body{background:#020617;color:#e2e8f0}
 <div class="flex justify-between items-center p-4 border-b border-slate-800/40">
 <h2 class="font-bold text-sm">📜 ประวัติสัญญาณ</h2>
 <span class="text-[10px] text-slate-500 font-medium" id="hc">0</span></div>
-<div class="overflow-x-auto">
-<table class="w-full text-[11px]">
+<div class="overflow-x-auto"><table class="w-full text-[11px]">
 <thead class="bg-slate-900/50"><tr class="text-slate-500 uppercase text-[9px] tracking-wider font-semibold">
 <th class="px-3 py-2.5 text-left">เวลา</th><th class="px-3 py-2.5">หุ้น</th><th class="px-3 py-2.5">ประเภท</th><th class="px-3 py-2.5">ทิศทาง</th>
 <th class="px-3 py-2.5 text-right">Entry</th><th class="px-3 py-2.5 text-right">SL</th>
@@ -1034,13 +1021,13 @@ body{background:#020617;color:#e2e8f0}
 <tbody id="ht"><tr><td colspan="12" class="py-8 text-center text-slate-600">รอสัญญาณ...</td></tr></tbody>
 </table></div></div>
 
-<div class="mt-4 text-center text-slate-700 text-[9px] pb-6">⚠️ เพื่อการศึกษาเท่านั้น ไม่ใช่คำแนะนำการลงทุน | TCSM Thai Stock Pro v4.0 Production</div>
+<div class="mt-4 text-center text-slate-700 text-[9px] pb-6">⚠️ เพื่อการศึกษาเท่านั้น ไม่ใช่คำแนะนำการลงทุน | TCSM Thai Stock Pro v4.1</div>
 </div>
 
 <script>
 const P={},A={},S={},H=[];
 let cn=false,pf_='all',sf_='all';
-const so=io({transports:['websocket','polling'],reconnection:true,reconnectionDelay:1000,reconnectionDelayMax:5000,reconnectionAttempts:Infinity,timeout:30000,forceNew:false});
+const so=io({transports:['websocket','polling'],reconnection:true,reconnectionDelay:1000,reconnectionDelayMax:5000,reconnectionAttempts:Infinity,timeout:30000});
 
 function uc(){
 const d=new Date(new Date().toLocaleString("en-US",{timeZone:"Asia/Bangkok"}));
@@ -1049,17 +1036,14 @@ const h=d.getHours(),m=d.getMinutes(),wd=d.getDay(),t=h*60+m;let s='ปิดต
 if(wd===0||wd===6)s='วันหยุด 🔒';else if(t<570)s='ก่อนเปิดตลาด';else if(t<600)s='เปิดจับคู่ ☀️';
 else if(t<660)s='เช้า ⭐⭐';else if(t<750)s='เช้า ⭐';else if(t<870)s='พักเที่ยง 🍜';
 else if(t<930)s='บ่าย ⭐';else if(t<990)s='ช่วงปิด ⭐⭐';else if(t<1020)s='ปิดจับคู่';
-document.getElementById('ses').textContent=s;
-}
+document.getElementById('ses').textContent=s;}
 setInterval(uc,1000);uc();
 
-function lo(m,t='info'){
-const e=document.getElementById('lg');
-const c={signal:'text-emerald-400',error:'text-red-400',info:'text-slate-400',sys:'text-violet-400',warn:'text-amber-400'};
+function lo(m,t='info'){const e=document.getElementById('lg');
+const c={signal:'text-emerald-400',error:'text-red-400',info:'text-slate-400',sys:'text-violet-400'};
 const d=document.createElement('div');d.className=(c[t]||'text-slate-400')+' leading-snug';
 d.textContent=`[${new Date().toLocaleTimeString('en-GB',{timeZone:'Asia/Bangkok',hour12:false})}] ${m}`;
-e.insertBefore(d,e.firstChild);while(e.children.length>80)e.removeChild(e.lastChild);
-}
+e.insertBefore(d,e.firstChild);while(e.children.length>80)e.removeChild(e.lastChild);}
 
 function fP(c){pf_=c;document.querySelectorAll('.pf').forEach(b=>{b.classList.toggle('bg-amber-600/80',b.dataset.c===c);b.classList.toggle('bg-slate-700/60',b.dataset.c!==c)});rP();}
 function fS(c){sf_=c;document.querySelectorAll('.sf').forEach(b=>{b.classList.toggle('bg-amber-600/80',b.dataset.c===c);b.classList.toggle('bg-slate-700/60',b.dataset.c!==c)});rS();}
@@ -1067,12 +1051,10 @@ function sf(v,d=0){return typeof v==='number'&&isFinite(v)?v:d;}
 function fp(p){if(p<1)return p.toFixed(4);if(p<10)return p.toFixed(3);return p.toFixed(2);}
 function zc(z){return z.includes('BUY')?'text-emerald-400':z.includes('SELL')?'text-red-400':z.includes('BULL')?'text-emerald-500/80':z.includes('BEAR')?'text-red-500/80':'text-slate-500';}
 
-function rP(){
-let h='',n=0;const q=(document.getElementById('search')?.value||'').toUpperCase();
+function rP(){let h='',n=0;const q=(document.getElementById('search')?.value||'').toUpperCase();
 const syms=Object.keys(A).sort((a,b)=>Math.abs(sf(A[b]?.momentum))-Math.abs(sf(A[a]?.momentum)));
 for(const s of syms){const a=A[s];if(!a)continue;if(pf_!=='all'&&a.cat!==pf_)continue;if(q&&!s.includes(q))continue;n++;
-const cc=sf(a.change_pct)>=0?'text-emerald-400':'text-red-400';
-const mc=sf(a.momentum)>=0?'text-emerald-400':'text-red-400';
+const cc=sf(a.change_pct)>=0?'text-emerald-400':'text-red-400';const mc=sf(a.momentum)>=0?'text-emerald-400':'text-red-400';
 const hs=S[s]?`<span class="w-2 h-2 rounded-full inline-block ${S[s].direction==='BUY'?'bg-emerald-400':'bg-red-400'} pulse2"></span>`:'';
 const bw=Math.min(Math.abs(sf(a.momentum)),100);
 h+=`<div class="gc rounded-xl p-2.5 ${S[s]?'border-amber-600/20':''}"><div class="flex justify-between items-center">
@@ -1080,53 +1062,38 @@ h+=`<div class="gc rounded-xl p-2.5 ${S[s]?'border-amber-600/20':''}"><div class
 <div class="text-right"><span class="font-bold">฿${fp(sf(a.price))}</span> <span class="${cc} text-[10px] font-semibold">${sf(a.change_pct)>=0?'+':''}${sf(a.change_pct).toFixed(2)}%</span></div></div>
 <div class="flex justify-between mt-1.5 text-[9px]"><span class="${mc} font-semibold">Mom:${sf(a.momentum).toFixed(1)}</span>
 <span class="${zc(a.zone||'')} font-semibold">${a.zone||''}</span><span class="text-slate-400">Str:${sf(a.strength)}%</span><span class="text-slate-600">${a.trend||''}</span></div>
-<div class="mt-1.5 bg-slate-800/40 rounded-full h-1 overflow-hidden"><div class="${sf(a.momentum)>=0?'bg-gradient-to-r from-emerald-600 to-emerald-400':'bg-gradient-to-r from-red-600 to-red-400'} h-full rounded-full transition-all duration-500" style="width:${bw}%"></div></div></div>`;
-}
+<div class="mt-1.5 bg-slate-800/40 rounded-full h-1 overflow-hidden"><div class="${sf(a.momentum)>=0?'bg-gradient-to-r from-emerald-600 to-emerald-400':'bg-gradient-to-r from-red-600 to-red-400'} h-full rounded-full transition-all duration-500" style="width:${bw}%"></div></div></div>`;}
 if(!n)h='<div class="text-slate-600 text-center py-8 text-[11px]">กำลังสแกน...</div>';
-document.getElementById('pr').innerHTML=h;
-document.getElementById('ps').innerHTML=n>0?`<span class="text-emerald-400 pulse2">● ${n} ตัว</span>`:'กำลังโหลด';
-}
+document.getElementById('pr').innerHTML=h;document.getElementById('ps').innerHTML=n>0?`<span class="text-emerald-400 pulse2">● ${n} ตัว</span>`:'กำลังโหลด';}
 
-function rT(){
-const arr=Object.values(A).sort((a,b)=>Math.abs(sf(b.momentum))-Math.abs(sf(a.momentum))).slice(0,10);
+function rT(){const arr=Object.values(A).sort((a,b)=>Math.abs(sf(b.momentum))-Math.abs(sf(a.momentum))).slice(0,10);
 document.getElementById('tm').innerHTML=arr.map(a=>{const mc=sf(a.momentum)>=0?'text-emerald-400':'text-red-400';
 return`<div class="flex justify-between items-center py-1.5 border-b border-slate-800/20"><span class="font-bold text-[11px]">${a.symbol}</span>
 <span class="${mc} font-mono font-bold text-[11px]">${sf(a.momentum)>=0?'+':''}${sf(a.momentum).toFixed(1)}</span>
-<span class="text-[9px] ${zc(a.zone||'')} font-medium">${a.zone||''}</span></div>`}).join('')||'<div class="text-slate-600 text-xs py-4 text-center">รอข้อมูล...</div>';
-}
+<span class="text-[9px] ${zc(a.zone||'')} font-medium">${a.zone||''}</span></div>`}).join('')||'<div class="text-slate-600 text-xs py-4 text-center">รอข้อมูล...</div>';}
 
-function rHM(){
-const sectors={};
+function rHM(){const sectors={};
 const sT={'Energy':'พลังงาน','Banking':'ธนาคาร','Tech':'เทคโนฯ','Property':'อสังหา','Health':'สุขภาพ','Consumer':'อุปโภค','Transport':'ขนส่ง','Industry':'อุตฯ','Finance':'การเงิน','Other':'อื่นๆ'};
 Object.values(A).forEach(a=>{const cat=a.cat||'Other';if(!sectors[cat])sectors[cat]={sum:0,cnt:0,buy:0,sell:0};
 sectors[cat].sum+=sf(a.momentum);sectors[cat].cnt++;if(S[a.symbol]){S[a.symbol].direction==='BUY'?sectors[cat].buy++:sectors[cat].sell++;}});
 document.getElementById('hm').innerHTML=Object.entries(sectors).map(([k,v])=>{const avg=(v.sum/v.cnt).toFixed(1);
 const c=avg>=0?'from-emerald-950/40 to-emerald-900/20 border-emerald-700/20 text-emerald-400':'from-red-950/40 to-red-900/20 border-red-700/20 text-red-400';
 return`<div class="bg-gradient-to-br ${c} border rounded-xl p-2.5"><div class="font-bold text-[11px]">${sT[k]||k}</div>
-<div class="text-xs font-mono font-bold">${avg>=0?'+':''}${avg}</div><div class="text-[9px] text-slate-500 mt-0.5">${v.cnt} ตัว • ${v.buy}B/${v.sell}S</div></div>`}).join('');
-}
+<div class="text-xs font-mono font-bold">${avg>=0?'+':''}${avg}</div><div class="text-[9px] text-slate-500 mt-0.5">${v.cnt} ตัว • ${v.buy}B/${v.sell}S</div></div>`}).join('');}
 
-function rS(){
-let list=Object.values(S).sort((a,b)=>sf(b.strength)-sf(a.strength));
-if(sf_==='STRONG')list=list.filter(s=>s.type==='STRONG');
-else if(sf_==='BUY')list=list.filter(s=>s.direction==='BUY');
-else if(sf_==='SELL')list=list.filter(s=>s.direction==='SELL');
+function rS(){let list=Object.values(S).sort((a,b)=>sf(b.strength)-sf(a.strength));
+if(sf_==='STRONG')list=list.filter(s=>s.type==='STRONG');else if(sf_==='BUY')list=list.filter(s=>s.direction==='BUY');else if(sf_==='SELL')list=list.filter(s=>s.direction==='SELL');
 if(!list.length){document.getElementById('sg').innerHTML=`<div class="glass rounded-2xl p-10 text-center text-slate-500"><div class="text-4xl mb-3">📡</div><div class="text-sm font-medium">${Object.keys(S).length?'ไม่มีสัญญาณตรงตัวกรอง':'กำลังสแกน...'}</div></div>`;document.getElementById('si').textContent=Object.keys(S).length;return;}
 document.getElementById('si').textContent=Object.keys(S).length;
-document.getElementById('sg').innerHTML=list.slice(0,20).map(s=>{const ib=s.direction==='BUY';const dc=ib?'text-emerald-400':'text-red-400';
-const cls=ib?'sb':'ss';
+document.getElementById('sg').innerHTML=list.slice(0,20).map(s=>{const ib=s.direction==='BUY';const dc=ib?'text-emerald-400':'text-red-400';const cls=ib?'sb':'ss';
 const tc=s.type==='STRONG'?'bg-gradient-to-r from-amber-500 to-orange-500':s.type==='CONF'?'bg-gradient-to-r from-cyan-500 to-blue-500':'bg-slate-600';
-const sw=Math.min(sf(s.strength),100);
-const scc=sw>=75?'bg-gradient-to-r from-emerald-500 to-emerald-400':sw>=50?'bg-gradient-to-r from-amber-500 to-yellow-400':'bg-slate-600';
-const dT=ib?'ซื้อ BUY':'ขาย SELL';
-const strColor=sw>=75?'text-emerald-400 border-emerald-500/30 bg-emerald-500/10':sw>=50?'text-amber-400 border-amber-500/30 bg-amber-500/10':'text-slate-400 border-slate-500/30 bg-slate-500/10';
-
+const sw=Math.min(sf(s.strength),100);const scc=sw>=75?'bg-gradient-to-r from-emerald-500 to-emerald-400':sw>=50?'bg-gradient-to-r from-amber-500 to-yellow-400':'bg-slate-600';
+const dT=ib?'ซื้อ BUY':'ขาย SELL';const strColor=sw>=75?'text-emerald-400 border-emerald-500/30 bg-emerald-500/10':sw>=50?'text-amber-400 border-amber-500/30 bg-amber-500/10':'text-slate-400 border-slate-500/30 bg-slate-500/10';
 return`<div class="glass ${cls} rounded-2xl p-4 slideUp"><div class="flex justify-between items-start mb-3"><div>
-<div class="flex items-center gap-2">
-<span class="text-lg font-black ${dc}">${ib?'🟢':'🔴'} ${s.symbol}</span>
+<div class="flex items-center gap-2"><span class="text-lg font-black ${dc}">${ib?'🟢':'🔴'} ${s.symbol}</span>
 <span class="px-2.5 py-0.5 rounded-lg text-[10px] font-bold text-white ${tc} shadow-sm">${s.type} ${dT}</span>
 <span class="tag bg-slate-800/60 text-slate-400 border border-slate-700/30">${s.sector||''}</span></div>
-<div class="text-[10px] text-slate-500 mt-1 space-x-2"><span>Mom:${sf(s.momentum).toFixed(1)}</span><span>•</span><span>Conf:${sf(s.conf)}/3</span><span>•</span><span>${s.trend||''}</span><span>•</span><span>RSI:${sf(s.rsi_v,'?')}</span></div></div>
+<div class="text-[10px] text-slate-500 mt-1">Mom:${sf(s.momentum).toFixed(1)} • Conf:${sf(s.conf)}/3 • ${s.trend||''} • RSI:${sf(s.rsi_v,'?')}</div></div>
 <div class="text-right"><div class="strength-ring ${strColor} border text-[13px]">${sf(s.strength)}%</div>
 <div class="text-[9px] text-slate-600 mt-1">${s.timestamp||''}</div></div></div>
 <div class="grid grid-cols-5 gap-2 mb-3">
@@ -1140,66 +1107,43 @@ return`<div class="glass ${cls} rounded-2xl p-4 slideUp"><div class="flex justif
 <span class="text-slate-400 text-[10px]">R:R <b class="text-slate-200">${sf(s.rr)}:1</b></span>
 <span class="text-slate-400 text-[10px]">Risk <b class="text-slate-200">${sf(s.risk_pct)}%</b></span>
 <span class="text-[10px] font-bold ${(s.mtf_align||'').includes('BUY')?'text-emerald-400':(s.mtf_align||'').includes('SELL')?'text-red-400':'text-slate-500'}">${s.mtf_align||''}</span></div>
-<div class="flex flex-wrap gap-1">${(s.reasons||[]).slice(0,10).map(r=>`<span class="tag bg-slate-800/60 text-slate-300 border border-slate-700/25">${r}</span>`).join('')}</div></div>`;}).join('');
-}
+<div class="flex flex-wrap gap-1">${(s.reasons||[]).slice(0,10).map(r=>`<span class="tag bg-slate-800/60 text-slate-300 border border-slate-700/25">${r}</span>`).join('')}</div></div>`}).join('');}
 
-function rH(){
-if(!H.length){document.getElementById('ht').innerHTML='<tr><td colspan="12" class="py-8 text-center text-slate-600">รอสัญญาณ...</td></tr>';return;}
+function rH(){if(!H.length){document.getElementById('ht').innerHTML='<tr><td colspan="12" class="py-8 text-center text-slate-600">รอสัญญาณ...</td></tr>';return;}
 document.getElementById('hc').textContent=H.length+' สัญญาณ';
-document.getElementById('ht').innerHTML=H.slice(0,80).map(s=>{
-const dc=s.direction==='BUY'?'text-emerald-400 bg-emerald-500/10':'text-red-400 bg-red-500/10';
-const tc=s.type==='STRONG'?'text-amber-400':s.type==='CONF'?'text-cyan-400':'text-slate-400';
-const dT=s.direction==='BUY'?'ซื้อ':'ขาย';
+document.getElementById('ht').innerHTML=H.slice(0,80).map(s=>{const dc=s.direction==='BUY'?'text-emerald-400 bg-emerald-500/10':'text-red-400 bg-red-500/10';
+const tc=s.type==='STRONG'?'text-amber-400':s.type==='CONF'?'text-cyan-400':'text-slate-400';const dT=s.direction==='BUY'?'ซื้อ':'ขาย';
 return`<tr class="border-t border-slate-800/20 hover:bg-slate-800/15 transition-colors">
 <td class="px-3 py-2 text-slate-500 text-[10px]">${s.timestamp||''}</td>
-<td class="px-3 py-2 font-bold text-center">${s.symbol}</td>
-<td class="px-3 py-2 text-center ${tc} font-bold">${s.type}</td>
+<td class="px-3 py-2 font-bold text-center">${s.symbol}</td><td class="px-3 py-2 text-center ${tc} font-bold">${s.type}</td>
 <td class="px-3 py-2 text-center"><span class="px-2 py-0.5 rounded-md ${dc} font-bold text-[10px]">${dT}</span></td>
-<td class="px-3 py-2 text-right font-mono">฿${fp(sf(s.entry))}</td>
-<td class="px-3 py-2 text-right font-mono text-red-400">฿${fp(sf(s.sl))}</td>
-<td class="px-3 py-2 text-right font-mono text-emerald-400">฿${fp(sf(s.tp1))}</td>
-<td class="px-3 py-2 text-right font-mono text-emerald-300">฿${fp(sf(s.tp2))}</td>
+<td class="px-3 py-2 text-right font-mono">฿${fp(sf(s.entry))}</td><td class="px-3 py-2 text-right font-mono text-red-400">฿${fp(sf(s.sl))}</td>
+<td class="px-3 py-2 text-right font-mono text-emerald-400">฿${fp(sf(s.tp1))}</td><td class="px-3 py-2 text-right font-mono text-emerald-300">฿${fp(sf(s.tp2))}</td>
 <td class="px-3 py-2 font-bold text-center">${sf(s.rr)}:1</td>
 <td class="px-3 py-2 text-center"><span class="px-1.5 py-0.5 rounded-md ${sf(s.strength)>=75?'bg-emerald-500/15 text-emerald-400':sf(s.strength)>=50?'bg-amber-500/15 text-amber-400':'bg-slate-700/50 text-slate-400'} font-bold">${sf(s.strength)}%</span></td>
 <td class="px-3 py-2 text-center font-mono font-bold ${sf(s.momentum)>=0?'text-emerald-400':'text-red-400'}">${sf(s.momentum)>=0?'+':''}${sf(s.momentum).toFixed(1)}</td>
-<td class="px-3 py-2 text-center text-[10px] font-bold ${(s.mtf_align||'').includes('BUY')?'text-emerald-400':(s.mtf_align||'').includes('SELL')?'text-red-400':'text-slate-500'}">${s.mtf_align||''}</td></tr>`}).join('');
-}
+<td class="px-3 py-2 text-center text-[10px] font-bold ${(s.mtf_align||'').includes('BUY')?'text-emerald-400':(s.mtf_align||'').includes('SELL')?'text-red-400':'text-slate-500'}">${s.mtf_align||''}</td></tr>`}).join('');}
 
-function sA(s){
-const dT=s.direction==='BUY'?'ซื้อ':'ขาย';
-document.getElementById('ai').textContent=s.direction==='BUY'?'🟢':'🔴';
+function sA(s){const dT=s.direction==='BUY'?'ซื้อ':'ขาย';document.getElementById('ai').textContent=s.direction==='BUY'?'🟢':'🔴';
 document.getElementById('at').textContent=`${s.type} ${dT} — ${s.symbol} @ ฿${fp(sf(s.entry))}`;
 document.getElementById('ax').textContent=`SL:฿${fp(sf(s.sl))} TP2:฿${fp(sf(s.tp2))} Str:${sf(s.strength)}% Mom:${sf(s.momentum).toFixed(1)}`;
 document.getElementById('al').classList.remove('hidden');
 try{const c=new(window.AudioContext||window.webkitAudioContext)();const o=c.createOscillator();const g=c.createGain();o.connect(g);g.connect(c.destination);o.frequency.value=s.direction==='BUY'?880:660;g.gain.value=0.06;o.start();o.stop(c.currentTime+0.12);}catch(e){}
-setTimeout(()=>document.getElementById('al').classList.add('hidden'),12000);
-}
+setTimeout(()=>document.getElementById('al').classList.add('hidden'),12000);}
 
-function loadState(d){
-if(!d)return;
-if(d.prices)Object.assign(P,d.prices);
+function loadState(d){if(!d)return;if(d.prices)Object.assign(P,d.prices);
 if(d.signals){for(const[k,v]of Object.entries(d.signals)){S[k]=v;}}
 if(d.analysis){for(const[k,v]of Object.entries(d.analysis)){A[k]=v;}}
 if(d.history){const ids=new Set(H.map(h=>h.id));const ni=(d.history||[]).filter(h=>!ids.has(h.id));H.unshift(...ni);if(H.length===0&&d.history.length>0)H.push(...d.history);}
 if(d.stats){document.getElementById('bu').textContent=d.stats.buy||0;document.getElementById('se').textContent=d.stats.sell||0;document.getElementById('st2').textContent=d.stats.strong||0;}
-document.getElementById('scc').textContent=d.scan_count||0;
-rP();rS();rH();rT();rHM();
-}
+document.getElementById('scc').textContent=d.scan_count||0;rP();rS();rH();rT();rHM();}
 
-function doRefresh(){
-lo('รีเฟรช...','sys');
-fetch('/api/signals').then(r=>r.json()).then(d=>{
-if(d.signals){for(const[k,v]of Object.entries(d.signals)){S[k]=v;}}
-if(d.history){H.length=0;H.push(...d.history);}
+function doRefresh(){lo('รีเฟรช...','sys');fetch('/api/signals').then(r=>r.json()).then(d=>{
+if(d.signals){for(const[k,v]of Object.entries(d.signals)){S[k]=v;}}if(d.history){H.length=0;H.push(...d.history);}
 if(d.stats){document.getElementById('bu').textContent=d.stats.buy||0;document.getElementById('se').textContent=d.stats.sell||0;document.getElementById('st2').textContent=d.stats.strong||0;}
-rS();rH();lo(`รีเฟรชแล้ว: ${Object.keys(S).length} สัญญาณ`,'sys');
-}).catch(e=>lo('ล้มเหลว: '+e,'error'));
-}
-
-// Auto-sync if empty
+rS();rH();lo(`รีเฟรชแล้ว: ${Object.keys(S).length} สัญญาณ`,'sys');}).catch(e=>lo('ล้มเหลว: '+e,'error'));}
 setInterval(()=>{if(Object.keys(A).length===0){lo('Auto-sync...','sys');doRefresh();}},30000);
 
-// Socket events
 so.on('connect',()=>{cn=true;document.getElementById('st').innerHTML='<span class="text-emerald-400 pulse2 font-semibold">● LIVE</span>';lo('เชื่อมต่อแล้ว','sys');});
 so.on('disconnect',()=>{cn=false;document.getElementById('st').innerHTML='<span class="text-red-400 font-semibold">● Offline</span>';lo('ขาดการเชื่อมต่อ','error');});
 so.on('reconnect',()=>{lo('เชื่อมต่อใหม่','sys');so.emit('request_state');});
@@ -1247,13 +1191,12 @@ def dashboard():
 @app.route('/health')
 def health():
     return jsonify(sanitize({
-        'status': 'ok', 'version': '4.0', 'time': dts(),
+        'status': 'ok', 'version': '4.1-gevent', 'time': dts(),
         'scans': store.scan_count, 'stocks': len(C.STOCKS),
         'active_signals': len(store.signals),
         'connected': store.connected,
         'first_scan_done': store.first_scan_done,
         'dead_tickers': list(yfc._dead_tickers),
-        'ok': store.ok_count, 'fail': store.fail_count,
     }))
 
 @app.route('/api/signals')
@@ -1272,7 +1215,7 @@ def api_refresh():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  WEBSOCKET HANDLERS — with error protection
+#  WEBSOCKET HANDLERS
 # ═══════════════════════════════════════════════════════════════════════════════
 @socketio.on('connect')
 def ws_conn():
@@ -1280,7 +1223,7 @@ def ws_conn():
     try:
         emit('init', store.get_state())
     except Exception as e:
-        logger.warning(f"WS init emit: {e}")
+        logger.warning(f"WS init: {e}")
 
 @socketio.on('disconnect')
 def ws_disc():
@@ -1290,22 +1233,21 @@ def ws_disc():
 def ws_req():
     try:
         emit('full_sync', store.get_state())
-    except Exception:
+    except:
         pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  STARTUP
+#  STARTUP — Use gevent.spawn instead of eventlet.spawn
 # ═══════════════════════════════════════════════════════════════════════════════
 port = int(os.environ.get('PORT', 8000))
-eventlet.spawn(scanner)
+gevent.spawn(scanner)
 
 if __name__ == '__main__':
     print("=" * 65)
-    print("  🇹🇭 TCSM THAI STOCK PRO v4.0 — PRODUCTION GRADE")
+    print("  🇹🇭 TCSM THAI STOCK PRO v4.1 — PRODUCTION (GEVENT)")
     print("  📊 Yahoo Finance: Direct API + yfinance + Auto-delist")
     print(f"  🕐 Time: {dts()} ICT | Stocks: {len(C.STOCKS)}")
     print(f"  🌐 Port: {port} | Login: admin / admin123")
     print("=" * 65)
     socketio.run(app, host='0.0.0.0', port=port, debug=False, use_reloader=False)
-
